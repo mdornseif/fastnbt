@@ -20,13 +20,20 @@ pub enum CompressionScheme {
 
 pub struct Region<S: Seek + Read> {
     data: S,
+    // big-endian integers, representing the last modification time of a chunk 
+    // in epoch seconds
+    timestamps: Vec<u32>,
+    // the first three bytes are a (big-endian) offset in 4KiB sectors 
+    // from the start of the file, and a remaining byte that gives the 
+    // length of the chunk (also in 4KiB sectors, rounded up)
+    locations: Vec<Option<ChunkLocation>>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub struct ChunkLocation {
     pub begin_sector: usize,
     pub sector_count: usize,
-    pub x: usize,
+    pub x: usize, 
     pub z: usize,
 }
 
@@ -56,9 +63,59 @@ impl ChunkMeta {
     }
 }
 
+// find the file offset within a region file
+pub fn chunk_offset(x: usize, z: usize) -> usize {
+    ((x % 32) + (z % 32) * 32) as usize
+}
+
 impl<S: Seek + Read> Region<S> {
-    pub fn new(data: S) -> Self {
-        Self { data }
+    pub fn new(mut data: S) -> Self {
+        let mut locations = [None; 1024];
+        let mut timestamps = [0u32; 1024];
+
+        // Locations
+        let mut locbuf = vec![0u8; 4096];
+        data.read_exact(&mut locbuf[..]).unwrap();
+
+        // Timestamps
+        let mut tsbuf = vec![0u8; 4096];
+        data.read_exact(&mut tsbuf[..]).unwrap();
+        let mut rdr = Cursor::new(tsbuf);
+        rdr.read_u32_into::<BigEndian>(&mut timestamps).unwrap();
+
+        // Decode Locations
+        for xpos in 0..32 {
+            for zpos in 0..32 {
+                let pos = 4 * chunk_offset(xpos, zpos);
+                let mut off = 0usize;
+                off = off | ((locbuf[pos + 0] as usize) << 16);
+                off = off | ((locbuf[pos + 1] as usize) << 8);
+                off = off | ((locbuf[pos + 2] as usize) << 0);
+                let count = locbuf[pos+3] as usize;
+                if off > 0 && count > 0 {
+                    locations[chunk_offset(xpos, zpos)] = Some(ChunkLocation {
+                        begin_sector: off,
+                        sector_count: count,
+                        x: xpos as usize,
+                        z: zpos as usize});
+                    if timestamps[chunk_offset(xpos, zpos)] == 0 {
+                        eprintln!("invalid timestamp for existing chunk: {} {}, fixing", xpos, zpos);
+                        timestamps[chunk_offset(xpos, zpos)] = 1
+                    }
+                } else {
+                    if timestamps[chunk_offset(xpos, zpos)] != 0 {
+                        eprintln!("invalid timestamp for empty chunk: {} {} {}, fixing", timestamps[chunk_offset(xpos, zpos)],  xpos, zpos);
+                        timestamps[chunk_offset(xpos, zpos)] = 0
+                    }
+                }
+            }
+        }
+
+        Self {
+            data, 
+            locations: locations.to_vec(), 
+            timestamps: timestamps.to_vec(), 
+        }
     }
 
     /// Return the (region-relative) Chunk location (x, z)
@@ -67,24 +124,10 @@ impl<S: Seek + Read> Region<S> {
             return Err(Error::InvalidOffset(x, z));
         }
 
-        let pos = 4 * ((x % 32) + (z % 32) * 32);
-
-        self.data.seek(SeekFrom::Start(pos as u64))?;
-
-        let mut buf = [0u8; 4];
-        self.data.read_exact(&mut buf[..])?;
-
-        let mut off = 0usize;
-        off = off | ((buf[0] as usize) << 16);
-        off = off | ((buf[1] as usize) << 8);
-        off = off | ((buf[2] as usize) << 0);
-        let count = buf[3] as usize;
-        Ok(ChunkLocation {
-            begin_sector: off,
-            sector_count: count,
-            x,
-            z,
-        })
+        match self.locations[chunk_offset(x, z)] {
+            Some(offset) => Ok(offset),
+            _ => Err(Error::ChunkNotFound)
+        }
     }
 
     /// Return the raw, compressed data for a chunk at ChunkLocation
